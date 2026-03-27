@@ -1,57 +1,79 @@
 import requests
-import sqlite3
+import psycopg2
 import json
 from typing import List, Dict, Optional
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configuration
 GOOGLE_PLACES_API_URL = "https://places.googleapis.com/v1/places:searchText"
 API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "YOUR_API_KEY_HERE")
-DB_NAME = "restaurants.db"
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "api_places")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 SEARCH_QUERY = "restaurants with gluten free options"
 MAX_RESULTS = 100
 GLUTEN_KEYWORDS = ["gluten", "gluten-free", "celiac", "gf"]
 
 
 class RestaurantFinder:
-    """Handles Google Places API calls and SQLite database operations."""
+    """Handles Google Places API calls and PostgreSQL database operations."""
     
-    def __init__(self, api_key: str, db_name: str = "restaurants.db"):
+    def __init__(self, api_key: str, db_host: str, db_port: int, db_name: str, db_user: str, db_password: str):
         self.api_key = api_key
+        self.db_host = db_host
+        self.db_port = db_port
         self.db_name = db_name
+        self.db_user = db_user
+        self.db_password = db_password
         self.session = requests.Session()
         self.init_database()
     
     def init_database(self):
-        """Initialize SQLite database with required tables."""
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS restaurants (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                address TEXT,
-                latitude REAL,
-                longitude REAL,
-                rating REAL,
-                review_count INTEGER,
-                website TEXT,
-                phone TEXT,
-                gluten_mention_count INTEGER DEFAULT 0,
-                reviews_with_gluten TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        """Initialize PostgreSQL database with required tables."""
+        try:
+            conn = psycopg2.connect(
+                host=self.db_host,
+                port=self.db_port,
+                database=self.db_name,
+                user=self.db_user,
+                password=self.db_password
             )
-        """)
-        
-        conn.commit()
-        conn.close()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS restaurants (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    address TEXT,
+                    latitude REAL,
+                    longitude REAL,
+                    rating REAL,
+                    review_count INTEGER,
+                    website TEXT,
+                    phone TEXT,
+                    gluten_mention_count INTEGER DEFAULT 0,
+                    reviews_with_gluten TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            conn.commit()
+            conn.close()
+        except psycopg2.Error as e:
+            print(f"Database connection error: {e}")
     
     def search_restaurants(self, query: str) -> Optional[Dict]:
         """Search restaurants using Google Places API."""
         headers = {
             "Content-Type": "application/json",
-            "X-Goog-Api-Key": self.api_key
+            "X-Goog-Api-Key": self.api_key,
+            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.websiteUri,places.internationalPhoneNumber,places.reviews"
         }
         
         payload = {
@@ -85,23 +107,39 @@ class RestaurantFinder:
             return count, gluten_reviews
         
         for review in reviews:
-            text = review.get("text", "").lower()
+            # Handle nested text structure from Places API
+            text_obj = review.get("text", {})
+            if isinstance(text_obj, dict):
+                text = text_obj.get("text", "").lower()
+            else:
+                text = str(text_obj).lower()
+            
             if any(keyword in text for keyword in GLUTEN_KEYWORDS):
                 count += 1
-                gluten_reviews.append(review.get("text", ""))
+                gluten_reviews.append(text)
         
         return count, gluten_reviews
     
     def save_restaurant(self, place: Dict):
-        """Save restaurant data to SQLite database."""
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
+        """Save restaurant data to PostgreSQL database."""
+        try:
+            conn = psycopg2.connect(
+                host=self.db_host,
+                port=self.db_port,
+                database=self.db_name,
+                user=self.db_user,
+                password=self.db_password
+            )
+            cursor = conn.cursor()
+        except psycopg2.Error as e:
+            print(f"Database connection error: {e}")
+            return False
         
         place_id = place.get("id", "")
         name = place.get("displayName", {}).get("text", "Unknown")
         address = place.get("formattedAddress", "")
         rating = place.get("rating", None)
-        review_count = place.get("reviewCount", 0)
+        review_count = place.get("userRatingCount", 0)
         website = place.get("websiteUri", "")
         phone = place.get("internationalPhoneNumber", "")
         
@@ -117,17 +155,28 @@ class RestaurantFinder:
         
         try:
             cursor.execute("""
-                INSERT OR REPLACE INTO restaurants 
+                INSERT INTO restaurants 
                 (id, name, address, latitude, longitude, rating, review_count, 
                  website, phone, gluten_mention_count, reviews_with_gluten)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    address = EXCLUDED.address,
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    rating = EXCLUDED.rating,
+                    review_count = EXCLUDED.review_count,
+                    website = EXCLUDED.website,
+                    phone = EXCLUDED.phone,
+                    gluten_mention_count = EXCLUDED.gluten_mention_count,
+                    reviews_with_gluten = EXCLUDED.reviews_with_gluten
             """, (
                 place_id, name, address, latitude, longitude, rating, 
                 review_count, website, phone, gluten_count, gluten_reviews_json
             ))
             conn.commit()
             return True
-        except sqlite3.Error as e:
+        except psycopg2.Error as e:
             print(f"Database Error: {e}")
             return False
         finally:
@@ -135,26 +184,36 @@ class RestaurantFinder:
     
     def get_gluten_restaurants(self, limit: int = 10) -> List[Dict]:
         """Retrieve restaurants with gluten mentions from database."""
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, name, address, rating, review_count, website, phone, 
-                   gluten_mention_count, reviews_with_gluten
-            FROM restaurants
-            WHERE gluten_mention_count > 0
-            ORDER BY gluten_mention_count DESC, rating DESC
-            LIMIT ?
-        """, (limit,))
-        
-        columns = [description[0] for description in cursor.description]
-        results = []
-        
-        for row in cursor.fetchall():
-            results.append(dict(zip(columns, row)))
-        
-        conn.close()
-        return results
+        try:
+            conn = psycopg2.connect(
+                host=self.db_host,
+                port=self.db_port,
+                database=self.db_name,
+                user=self.db_user,
+                password=self.db_password
+            )
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, name, address, rating, review_count, website, phone, 
+                       gluten_mention_count, reviews_with_gluten
+                FROM restaurants
+                WHERE gluten_mention_count > 0
+                ORDER BY gluten_mention_count DESC, rating DESC
+                LIMIT %s
+            """, (limit,))
+            
+            columns = [description[0] for description in cursor.description]
+            results = []
+            
+            for row in cursor.fetchall():
+                results.append(dict(zip(columns, row)))
+            
+            conn.close()
+            return results
+        except psycopg2.Error as e:
+            print(f"Database Error: {e}")
+            return []
     
     def run(self, query: str = SEARCH_QUERY, limit: int = MAX_RESULTS):
         """Execute full workflow: search, filter, and save."""
@@ -243,7 +302,14 @@ def main():
         limit = MAX_RESULTS
     
     print()
-    finder = RestaurantFinder(api_key=API_KEY, db_name=DB_NAME)
+    finder = RestaurantFinder(
+        api_key=API_KEY,
+        db_host=DB_HOST,
+        db_port=DB_PORT,
+        db_name=DB_NAME,
+        db_user=DB_USER,
+        db_password=DB_PASSWORD
+    )
     finder.run(query=user_query, limit=limit)
 
 
