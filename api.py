@@ -13,7 +13,7 @@ API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "YOUR_API_KEY_HERE")
 app = FastAPI(
     title="Gluten-Free Restaurant Finder API",
     description="Search for gluten-free restaurants in any city using Google Places API with adaptive spiral coverage.",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 
@@ -46,6 +46,9 @@ def search(req: SearchRequest):
 
     The search automatically expands outward from the city center
     and stops when no new results are found.
+
+    Returns:
+    - Restaurant details including picture_url (small preview image)
     """
     if API_KEY == "YOUR_API_KEY_HERE":
         raise HTTPException(status_code=500, detail="GOOGLE_PLACES_API_KEY not configured.")
@@ -75,6 +78,8 @@ def get_saved_results(city: str, limit: int = 100):
     """
     Retrieve previously saved results for a city from the database.
     Useful in n8n to fetch results without re-running the search.
+
+    Returns restaurant details including picture_url.
     """
     import psycopg2
     DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -91,7 +96,7 @@ def get_saved_results(city: str, limit: int = 100):
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, name, address, city, latitude, longitude,
-                   rating, review_count, website, phone, google_maps_type_label
+                   rating, review_count, website, phone, google_maps_type_label, picture_url
             FROM restaurants
             WHERE LOWER(city) = LOWER(%s)
             ORDER BY rating DESC NULLS LAST

@@ -74,6 +74,27 @@ def build_spiral_grid(center_lat: float, center_lng: float, cell_radius_m: int) 
         ring += 1
 
 
+def extract_photo_url(place: Dict) -> Optional[str]:
+    """Extract a usable photo URL-like value from a Google Places result."""
+    photos = place.get("photos", [])
+    if not photos:
+        return None
+
+    photo = photos[0]
+
+    # Prefer attribution profile photo URI if present.
+    attributions = photo.get("authorAttributions", [])
+    if attributions and "photoUri" in attributions[0]:
+        return attributions[0]["photoUri"]
+
+    # Fallback to Google Maps URI for the photo object.
+    maps_uri = photo.get("googleMapsUri")
+    if maps_uri:
+        return maps_uri
+
+    return None
+
+
 class RestaurantFinder:
     """Handles Google Places API calls and PostgreSQL database operations."""
 
@@ -100,8 +121,13 @@ class RestaurantFinder:
                     phone TEXT,
                     google_maps_type_label TEXT,
                     city TEXT,
+                    picture_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+            cursor.execute("""
+                ALTER TABLE restaurants
+                ADD COLUMN IF NOT EXISTS picture_url TEXT
             """)
             conn.commit()
             conn.close()
@@ -123,7 +149,7 @@ class RestaurantFinder:
                 "places.id,places.displayName,places.formattedAddress,"
                 "places.location,places.rating,places.userRatingCount,"
                 "places.websiteUri,places.internationalPhoneNumber,"
-                "places.primaryTypeDisplayName,places.types"
+                "places.primaryTypeDisplayName,places.types,places.photos"
             )
         }
         payload = {
@@ -171,14 +197,15 @@ class RestaurantFinder:
         )
 
         location = place.get("location", {})
+        picture_url = extract_photo_url(place)
         try:
             conn = self._connect()
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO restaurants
                 (id, name, address, latitude, longitude, rating, review_count,
-                 website, phone, google_maps_type_label, city)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 website, phone, google_maps_type_label, city, picture_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     address = EXCLUDED.address,
@@ -189,7 +216,8 @@ class RestaurantFinder:
                     website = EXCLUDED.website,
                     phone = EXCLUDED.phone,
                     google_maps_type_label = EXCLUDED.google_maps_type_label,
-                    city = EXCLUDED.city
+                    city = EXCLUDED.city,
+                    picture_url = EXCLUDED.picture_url
             """, (
                 place.get("id"),
                 place.get("displayName", {}).get("text", "Unknown"),
@@ -201,7 +229,8 @@ class RestaurantFinder:
                 place.get("websiteUri", ""),
                 place.get("internationalPhoneNumber", ""),
                 type_label,
-                city
+                city,
+                picture_url
             ))
             conn.commit()
             conn.close()
@@ -275,6 +304,7 @@ def format_results(places: List[Dict], city: str) -> List[Dict]:
             place.get("primaryTypeDisplayName", {}).get("text", "")
         )
         location = place.get("location", {})
+        picture_url = extract_photo_url(place)
         output.append({
             "id": place.get("id"),
             "name": place.get("displayName", {}).get("text", "Unknown"),
@@ -287,5 +317,6 @@ def format_results(places: List[Dict], city: str) -> List[Dict]:
             "website": place.get("websiteUri", ""),
             "phone": place.get("internationalPhoneNumber", ""),
             "type": type_label,
+            "picture_url": picture_url,
         })
     return output
