@@ -12,6 +12,7 @@ load_dotenv()
 
 # Configuration
 GOOGLE_PLACES_API_URL = "https://places.googleapis.com/v1/places:searchText"
+GOOGLE_PLACE_PHOTO_MEDIA_BASE = "https://places.googleapis.com/v1"
 API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "YOUR_API_KEY_HERE")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -21,6 +22,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 
 SEARCH_QUERY = "gluten free restaurant"
 DEFAULT_CELL_RADIUS = int(os.getenv("DEFAULT_CELL_RADIUS", "3000"))  # 3 km per cell
+PREVIEW_IMAGE_MAX_WIDTH_PX = int(os.getenv("PREVIEW_IMAGE_MAX_WIDTH_PX", "480"))
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 
@@ -74,6 +76,52 @@ def build_spiral_grid(center_lat: float, center_lng: float, cell_radius_m: int) 
         ring += 1
 
 
+def _extract_single_picture_url(photo: Dict) -> Optional[str]:
+    photo_name = photo.get("name")
+    if photo_name and API_KEY != "YOUR_API_KEY_HERE":
+        return (
+            f"{GOOGLE_PLACE_PHOTO_MEDIA_BASE}/{photo_name}/media"
+            f"?maxWidthPx={PREVIEW_IMAGE_MAX_WIDTH_PX}&key={API_KEY}"
+        )
+    attributions = photo.get("authorAttributions", [])
+    if attributions and "photoUri" in attributions[0]:
+        return attributions[0]["photoUri"]
+    maps_uri = photo.get("googleMapsUri")
+    if maps_uri:
+        return maps_uri
+    return None
+
+
+def _score_photo(photo: Dict) -> int:
+    width = int(photo.get("widthPx") or 0)
+    height = int(photo.get("heightPx") or 0)
+    score = 0
+    if photo.get("name"):
+        score += 100
+    if width > 0 and height > 0:
+        score += min((width * height) // 100000, 50)
+        if width >= height:
+            score += 10
+        if width < 300 or height < 300:
+            score -= 40
+    return score
+
+
+def extract_photo_url(place: Dict) -> Optional[str]:
+    photos = place.get("photos", [])
+    candidates = []
+    seen = set()
+    for photo in photos:
+        url = _extract_single_picture_url(photo)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        candidates.append((_score_photo(photo), url))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
 class RestaurantFinder:
     """Handles Google Places API calls and PostgreSQL database operations."""
 
@@ -102,11 +150,12 @@ class RestaurantFinder:
                     opening_hours TEXT,
                     price_level TEXT,
                     city TEXT,
+                    picture_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             # Migrate existing tables that may be missing the new columns
-            for column, definition in [("opening_hours", "TEXT"), ("price_level", "TEXT")]:
+            for column, definition in [("opening_hours", "TEXT"), ("price_level", "TEXT"), ("picture_url", "TEXT")]:
                 cursor.execute("""
                     SELECT column_name FROM information_schema.columns
                     WHERE table_name = 'restaurants' AND column_name = %s
@@ -135,7 +184,7 @@ class RestaurantFinder:
                 "places.location,places.rating,places.userRatingCount,"
                 "places.websiteUri,places.internationalPhoneNumber,"
                 "places.primaryTypeDisplayName,places.types,"
-                "places.currentOpeningHours,places.priceLevel"
+                "places.currentOpeningHours,places.priceLevel,places.photos"
             )
         }
         payload = {
@@ -183,21 +232,18 @@ class RestaurantFinder:
         )
 
         location = place.get("location", {})
+        opening_hours_data = place.get("currentOpeningHours", {})
+        opening_hours = json.dumps(opening_hours_data) if opening_hours_data else None
+        price_level = place.get("priceLevel", "")
+        picture_url = extract_photo_url(place)
         try:
             conn = self._connect()
             cursor = conn.cursor()
-            # Extract opening hours
-            opening_hours_data = place.get("currentOpeningHours", {})
-            opening_hours = json.dumps(opening_hours_data) if opening_hours_data else None
-            
-            # Extract price level
-            price_level = place.get("priceLevel", "")
-            
             cursor.execute("""
                 INSERT INTO restaurants
                 (id, name, address, latitude, longitude, rating, review_count,
-                 website, phone, google_maps_type_label, opening_hours, price_level, city)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 website, phone, google_maps_type_label, opening_hours, price_level, city, picture_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     address = EXCLUDED.address,
@@ -210,7 +256,8 @@ class RestaurantFinder:
                     google_maps_type_label = EXCLUDED.google_maps_type_label,
                     opening_hours = EXCLUDED.opening_hours,
                     price_level = EXCLUDED.price_level,
-                    city = EXCLUDED.city
+                    city = EXCLUDED.city,
+                    picture_url = EXCLUDED.picture_url
             """, (
                 place.get("id"),
                 place.get("displayName", {}).get("text", "Unknown"),
@@ -224,7 +271,8 @@ class RestaurantFinder:
                 type_label,
                 opening_hours,
                 price_level,
-                city
+                city,
+                picture_url
             ))
             conn.commit()
             conn.close()
@@ -312,5 +360,6 @@ def format_results(places: List[Dict], city: str) -> List[Dict]:
             "type": type_label,
             "opening_hours": place.get("currentOpeningHours", {}),
             "price_level": place.get("priceLevel", ""),
+            "picture_url": extract_photo_url(place),
         })
     return output
