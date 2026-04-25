@@ -12,7 +12,6 @@ load_dotenv()
 
 # Configuration
 GOOGLE_PLACES_API_URL = "https://places.googleapis.com/v1/places:searchText"
-GOOGLE_PLACE_PHOTO_MEDIA_BASE = "https://places.googleapis.com/v1"
 API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "YOUR_API_KEY_HERE")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -22,8 +21,6 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 
 SEARCH_QUERY = "gluten free restaurant"
 DEFAULT_CELL_RADIUS = int(os.getenv("DEFAULT_CELL_RADIUS", "3000"))  # 3 km per cell
-MAX_PICTURES_PER_PLACE = 10
-PREVIEW_IMAGE_MAX_WIDTH_PX = int(os.getenv("PREVIEW_IMAGE_MAX_WIDTH_PX", "480"))
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 
@@ -77,77 +74,6 @@ def build_spiral_grid(center_lat: float, center_lng: float, cell_radius_m: int) 
         ring += 1
 
 
-def _extract_single_picture_url(photo: Dict) -> Optional[str]:
-    """Extract one usable URL-like value from a single photo object."""
-    photo_name = photo.get("name")
-    if photo_name and API_KEY != "YOUR_API_KEY_HERE":
-        return (
-            f"{GOOGLE_PLACE_PHOTO_MEDIA_BASE}/{photo_name}/media"
-            f"?maxWidthPx={PREVIEW_IMAGE_MAX_WIDTH_PX}&key={API_KEY}"
-        )
-
-    attributions = photo.get("authorAttributions", [])
-    if attributions and "photoUri" in attributions[0]:
-        return attributions[0]["photoUri"]
-
-    maps_uri = photo.get("googleMapsUri")
-    if maps_uri:
-        return maps_uri
-
-    return None
-
-
-def _score_photo(photo: Dict) -> int:
-    """Assign a simple quality score to rank place photos."""
-    width = int(photo.get("widthPx") or 0)
-    height = int(photo.get("heightPx") or 0)
-
-    score = 0
-    if photo.get("name"):
-        score += 100
-
-    if width > 0 and height > 0:
-        area = width * height
-        score += min(area // 100000, 50)
-        if width >= height:
-            score += 10
-        if width < 300 or height < 300:
-            score -= 40
-
-    return score
-
-
-def _sorted_photo_candidates(place: Dict) -> List[Tuple[int, str]]:
-    """Build and sort photo URL candidates from best to worst."""
-    photos = place.get("photos", [])
-    candidates: List[Tuple[int, str]] = []
-    seen = set()
-
-    for photo in photos:
-        url = _extract_single_picture_url(photo)
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        candidates.append((_score_photo(photo), url))
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates
-
-
-def extract_photo_url(place: Dict) -> Optional[str]:
-    """Extract the best-ranked photo URL-like value for a place."""
-    candidates = _sorted_photo_candidates(place)
-    if not candidates:
-        return None
-    return candidates[0][1]
-
-
-def extract_photo_urls(place: Dict) -> List[str]:
-    """Extract top-ranked picture URLs from a Google Places result."""
-    candidates = _sorted_photo_candidates(place)
-    return [url for _, url in candidates[:MAX_PICTURES_PER_PLACE]]
-
-
 class RestaurantFinder:
     """Handles Google Places API calls and PostgreSQL database operations."""
 
@@ -173,29 +99,21 @@ class RestaurantFinder:
                     website TEXT,
                     phone TEXT,
                     google_maps_type_label TEXT,
+                    opening_hours TEXT,
+                    price_level TEXT,
                     city TEXT,
-                    picture_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS pictures (
-                    id BIGSERIAL PRIMARY KEY,
-                    place_id TEXT NOT NULL,
-                    restaurant_name TEXT NOT NULL,
-                    picture_url TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT fk_pictures_restaurant
-                        FOREIGN KEY(place_id)
-                        REFERENCES restaurants(id)
-                        ON DELETE CASCADE,
-                    CONSTRAINT uq_place_picture UNIQUE (place_id, picture_url)
-                )
-            """)
-            cursor.execute("""
-                ALTER TABLE restaurants
-                ADD COLUMN IF NOT EXISTS picture_url TEXT
-            """)
+            # Migrate existing tables that may be missing the new columns
+            for column, definition in [("opening_hours", "TEXT"), ("price_level", "TEXT")]:
+                cursor.execute("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'restaurants' AND column_name = %s
+                """, (column,))
+                if not cursor.fetchone():
+                    cursor.execute(f"ALTER TABLE restaurants ADD COLUMN {column} {definition}")
+                    print(f"Migration: added column '{column}' to restaurants table")
             conn.commit()
             conn.close()
         except psycopg2.Error as e:
@@ -216,7 +134,8 @@ class RestaurantFinder:
                 "places.id,places.displayName,places.formattedAddress,"
                 "places.location,places.rating,places.userRatingCount,"
                 "places.websiteUri,places.internationalPhoneNumber,"
-                "places.primaryTypeDisplayName,places.types,places.photos"
+                "places.primaryTypeDisplayName,places.types,"
+                "places.currentOpeningHours,places.priceLevel"
             )
         }
         payload = {
@@ -264,17 +183,21 @@ class RestaurantFinder:
         )
 
         location = place.get("location", {})
-        restaurant_name = place.get("displayName", {}).get("text", "Unknown")
-        picture_url = extract_photo_url(place)
-        picture_urls = extract_photo_urls(place)
         try:
             conn = self._connect()
             cursor = conn.cursor()
+            # Extract opening hours
+            opening_hours_data = place.get("currentOpeningHours", {})
+            opening_hours = json.dumps(opening_hours_data) if opening_hours_data else None
+            
+            # Extract price level
+            price_level = place.get("priceLevel", "")
+            
             cursor.execute("""
                 INSERT INTO restaurants
                 (id, name, address, latitude, longitude, rating, review_count,
-                 website, phone, google_maps_type_label, city, picture_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 website, phone, google_maps_type_label, opening_hours, price_level, city)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     address = EXCLUDED.address,
@@ -285,11 +208,12 @@ class RestaurantFinder:
                     website = EXCLUDED.website,
                     phone = EXCLUDED.phone,
                     google_maps_type_label = EXCLUDED.google_maps_type_label,
-                    city = EXCLUDED.city,
-                    picture_url = EXCLUDED.picture_url
+                    opening_hours = EXCLUDED.opening_hours,
+                    price_level = EXCLUDED.price_level,
+                    city = EXCLUDED.city
             """, (
                 place.get("id"),
-                restaurant_name,
+                place.get("displayName", {}).get("text", "Unknown"),
                 place.get("formattedAddress", ""),
                 location.get("latitude"),
                 location.get("longitude"),
@@ -298,25 +222,10 @@ class RestaurantFinder:
                 place.get("websiteUri", ""),
                 place.get("internationalPhoneNumber", ""),
                 type_label,
-                city,
-                picture_url
+                opening_hours,
+                price_level,
+                city
             ))
-
-            place_id = place.get("id")
-            if place_id:
-                # Keep pictures table synchronized with latest API result for this place.
-                cursor.execute("DELETE FROM pictures WHERE place_id = %s", (place_id,))
-                for url in picture_urls:
-                    cursor.execute(
-                        """
-                        INSERT INTO pictures (place_id, restaurant_name, picture_url)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (place_id, picture_url) DO UPDATE SET
-                            restaurant_name = EXCLUDED.restaurant_name
-                        """,
-                        (place_id, restaurant_name, url)
-                    )
-
             conn.commit()
             conn.close()
             return True
@@ -389,7 +298,6 @@ def format_results(places: List[Dict], city: str) -> List[Dict]:
             place.get("primaryTypeDisplayName", {}).get("text", "")
         )
         location = place.get("location", {})
-        picture_url = extract_photo_url(place)
         output.append({
             "id": place.get("id"),
             "name": place.get("displayName", {}).get("text", "Unknown"),
@@ -402,6 +310,7 @@ def format_results(places: List[Dict], city: str) -> List[Dict]:
             "website": place.get("websiteUri", ""),
             "phone": place.get("internationalPhoneNumber", ""),
             "type": type_label,
-            "picture_url": picture_url,
+            "opening_hours": place.get("currentOpeningHours", {}),
+            "price_level": place.get("priceLevel", ""),
         })
     return output

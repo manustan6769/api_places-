@@ -96,7 +96,8 @@ def get_saved_results(city: str, limit: int = 100):
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, name, address, city, latitude, longitude,
-                   rating, review_count, website, phone, google_maps_type_label, picture_url
+                   rating, review_count, website, phone, google_maps_type_label,
+                   picture_url, opening_hours, price_level
             FROM restaurants
             WHERE LOWER(city) = LOWER(%s)
             ORDER BY rating DESC NULLS LAST
